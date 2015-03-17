@@ -1,0 +1,408 @@
+# HG changeset patch
+# User ajshaw <ajshaw@uchicago.edu>
+# Date 1407521570 18000
+# Node ID 83cbe61e1af7eabe7661aaa723987b399b05b16c
+# Parent  a69ed44ef8c802ce1db0872088e508f7729ed995
+# Parent  a9dd5cebefafc417b3bb0414d4d0bdf862b67c9a
+Merged in ajshaw/segway-hierarchical/posterior (pull request #8)
+
+posterior compatibility with sublabel output mode
+
+diff --git a/NEWS b/NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -55,6 +55,7 @@
+ * prereqs: hgtools is now a prerequisite
+ * segway: add --output-label option to control segmentation output when using sublabels
+ * segway: semi-supervised mode no longer causes assertion error
++* segway: posterior task now compatible with sublabel output mode
+ 
+ 1.1.0:
+ 
+diff --git a/doc/segway.rst b/doc/segway.rst
+--- a/doc/segway.rst
++++ b/doc/segway.rst
+@@ -568,11 +568,16 @@
+ The **posterior** inference task of Segway estimates for each position
+ of interest the probability that the model has a particular segment
+ label given the data. This information is delivered in a series of
+-numbered wiggle files, one for each segment label. The individual
+-values will vary from 0 to 100, showing the percentage probability at
+-each position for the label in that file. In most positions, the value
+-will be 0 or 100, and substantially reproduce the Viterbi path
+-determined from the **identify** task. The **posterior** task uses the
++numbered wiggle files, one for each segment label. In hierarchical 
++segmentation mode, setting the `--output-label` option to *full* or
++*subseg* will cause segway to produce a wiggle file for each sublabel
++instead, identified using the label and the sublabel in the file name 
++before the file extension. For example, the bedGraph file for label 0, 
++and sublabel 1 would be called ``posterior0.1.bedGraph``. The individual 
++values will vary from 0 to 100, showing the percentage probability at 
++each position for the label in that file. In most positions, the value 
++will be 0 or 100, and substantially reproduce the Viterbi path 
++determined from the **identify** task. The **posterior** task uses the 
+ same options for specifying a model and parameters as **identify**.
+ 
+ Posterior results can be useful in determining regions of ambiguous
+diff --git a/segway/_util.py b/segway/_util.py
+--- a/segway/_util.py
++++ b/segway/_util.py
+@@ -329,7 +329,7 @@
+         return label
+ 
+ 
+-def find_segment_starts(data, output_label="seg"):
++def find_segment_starts(data, output_label):
+     """
+     finds the start of each segment
+ 
+@@ -375,10 +375,8 @@
+     # int(bool) means 0 -> 0, 1+ -> 1
+     return (dividend // divisor) + int(bool(dividend % divisor))
+ 
+-re_posterior_entry = re.compile(r"^\d+: (\S+) seg\((\d+)\)=(\d+)$")
+ 
+-
+-def parse_posterior(iterable):
++def parse_posterior(iterable, output_label):
+     """
+     a generator.
+     yields tuples (index, label, prob)
+@@ -386,29 +384,50 @@
+     index: (int) frame index
+     label: (int) segment label
+     prob: (float) prob value
++    
++    in the case that output_label is set to output sublabels as well,
++    the label variable will be of the form (int, int) for the segment
++    label and sublabel
+     """
++    if output_label != "seg":
++        re_posterior_entry = re.compile(r"^\d+: (\S+) seg\((\d+)\)=(\d+),"
++                                         "subseg\((\d+)\)=(\d+)$")
++    else:
++        re_posterior_entry = re.compile(r"^\d+: (\S+) seg\((\d+)\)=(\d+)$")
+     # ignores non-matching lines
+     for line in iterable:
+         m_posterior_entry = re_posterior_entry.match(line.rstrip())
+ 
+         if m_posterior_entry:
+             group = m_posterior_entry.group
+-            yield (int(group(2)), int(group(3)), float(group(1)))
++            if output_label != "seg":
++                yield (int(group(2)), (int(group(3)), int(group(5))),
++                       float(group(1)))
++            else:
++                yield (int(group(2)), int(group(3)), float(group(1)))
+ 
+ 
+-def read_posterior(infile, num_frames, num_labels):
++def read_posterior(infile, num_frames, num_labels, 
++                   num_sublabels, output_label):
+     """
+     returns an array (num_frames, num_labels)
+     """
+     # XXX: should these be single precision?
+-    res = zeros((num_frames, num_labels))
++    res = zeros((num_frames, num_labels * num_sublabels))
+ 
+-    for frame_index, label, prob in parse_posterior(infile):
++    for frame_index, label, prob in parse_posterior(infile, output_label):
++        if output_label != "seg":
++            label, sublabel = label
++            seg_index = label * num_sublabels + sublabel
++            if sublabel >= num_sublabels:
++                raise ValueError("saw sublabel %s but num_sublabels is only %s"
++                                % (sublabel, num_sublabels))
++        else:
++            seg_index = label
+         if label >= num_labels:
+             raise ValueError("saw label %s but num_labels is only %s"
+                              % (label, num_labels))
+-
+-        res[frame_index, label] = prob
++        res[frame_index, seg_index] = prob
+ 
+     return res
+ 
+diff --git a/segway/output.py b/segway/output.py
+--- a/segway/output.py
++++ b/segway/output.py
+@@ -92,7 +92,7 @@
+         outfile.write(last_line)
+ 
+ class OutputSaver(Copier):
+-    copy_attrs = ["tracks", "uuid", "num_worlds", "num_segs"]
++    copy_attrs = ["tracks", "uuid", "num_worlds", "num_segs", "num_subsegs"]
+ 
+     attrs = dict(visibility="dense",
+                  viewLimits="0:1",
+@@ -149,15 +149,22 @@
+ 
+ 
+ class PosteriorSaver(OutputSaver):
+-    copy_attrs = OutputSaver.copy_attrs + ["bedgraph_filename", "bed_filename", "posterior_filenames"]
+-
+-    bedgraph_header_tmpl = "track type=bedGraph name=posterior.%d \
+-        description=\"Segway posterior probability of label %d\" \
+-        visibility=dense  viewLimits=0:100 maxHeightPixels=0:0:10 \
+-        autoScale=off color=200,100,0 altColor=0,100,200"
++    copy_attrs = OutputSaver.copy_attrs + ["bedgraph_filename", "bed_filename",
++                                           "posterior_filenames",
++                                           "output_label"]
+ 
+     def make_bedgraph_header(self, num_seg):
+-        return self.bedgraph_header_tmpl % (num_seg, num_seg)
++        if self.output_label == "full":
++            bedgraph_header_tmpl = "track type=bedGraph name=posterior.%s \
++            description=\"Segway posterior probability of label %s\" \
++            visibility=dense  viewLimits=0:100 maxHeightPixels=0:0:10 \
++            autoScale=off color=200,100,0 altColor=0,100,200"
++        else:
++            bedgraph_header_tmpl = "track type=bedGraph name=posterior.%d \
++            description=\"Segway posterior probability of label %d\" \
++            visibility=dense  viewLimits=0:100 maxHeightPixels=0:0:10 \
++            autoScale=off color=200,100,0 altColor=0,100,200"
++        return bedgraph_header_tmpl % (num_seg, num_seg)
+ 
+     def __call__(self, world):
+         # Save posterior code bed file
+@@ -168,7 +175,15 @@
+ 
+         # Save posterior bedgraph files
+         posterior_bedgraph_tmpl = self.make_filename(self.bedgraph_filename, world)
+-        for num_seg in xrange(self.num_segs):
++        if self.output_label == "subseg":
++            label_print_range = xrange(self.num_segs * self.num_subsegs)
++        elif self.output_label == "full":
++            label_print_range = ("%d.%d" % divmod(label, self.num_subsegs)
++                                 for label in xrange(self.num_segs *
++                                                     self.num_subsegs))
++        else:
++            label_print_range = xrange(self.num_segs)
++        for num_seg in label_print_range:
+             posterior_filenames = map(lambda posterior_tmpl: posterior_tmpl % num_seg, self.posterior_filenames)
+             header = self.make_bedgraph_header(num_seg)
+             concatenate_window_segmentations(posterior_filenames, header, posterior_bedgraph_tmpl % num_seg)
+diff --git a/segway/run.py b/segway/run.py
+--- a/segway/run.py
++++ b/segway/run.py
+@@ -364,7 +364,7 @@
+     job_tmpl.workingDirectory = path.getcwd()
+ 
+ 
+-def rewrite_cliques(rewriter, frame):
++def rewrite_cliques(rewriter, frame, output_label):
+     """
+     returns the index of the added clique
+     """
+@@ -380,7 +380,11 @@
+         rewriter.next()
+ 
+     # new clique
+-    rewriter.send(NewLine("%d 1 seg %d" % (orig_num_cliques, frame)))
++    if output_label != "seg":
++        rewriter.send(NewLine("%d 2 seg %d subseg %d" % 
++                              (orig_num_cliques, frame, frame)))
++    else:
++        rewriter.send(NewLine("%d 1 seg %d" % (orig_num_cliques, frame)))
+ 
+     # XXX: add subseg as a clique to report it in posterior
+ 
+@@ -977,7 +981,8 @@
+ 
+                 components_indexed = enumerate(POSTERIOR_CLIQUE_INDICES)
+                 for component_index, component in components_indexed:
+-                    clique_index = rewrite_cliques(rewriter, component_index)
++                    clique_index = rewrite_cliques(rewriter, component_index,
++                                                   self.output_label)
+                     clique_indices[component] = clique_index
+ 
+                 for line in rewriter:
+@@ -2169,9 +2174,9 @@
+         prefix_args = [find_executable("segway-task"), "run", kind,
+                        output_filename, window.chrom,
+                        window.start, window.end, self.resolution, is_reverse,
+-                       self.num_segs, self.output_label, self.genomedataname,
+-                       float_filepath, int_filepath, self.distribution,
+-                       track_indexes_text]
++                       self.num_segs, self.num_subsegs, self.output_label,
++                       self.genomedataname, float_filepath, int_filepath,
++                       self.distribution, track_indexes_text]
+         output_filename = None
+ 
+         num_frames = self.window_lens[window_index]
+@@ -2344,8 +2349,6 @@
+                         if (self.posterior and (self.recover_dirname
+                                                 or self.num_worlds != 1)):
+                             raise NotImplementedError  # XXX
+-                        if (self.posterior and self.output_label != "seg"):
+-                            raise NotImplementedError  # XXX
+ 
+                         self.run_identify_posterior()
+ 
+diff --git a/segway/task.py b/segway/task.py
+--- a/segway/task.py
++++ b/segway/task.py
+@@ -16,7 +16,7 @@
+ from tempfile import gettempdir, mkstemp
+ 
+ from genomedata import Genome
+-from numpy import argmax, array, empty, where, diff, r_
++from numpy import argmax, array, empty, where, diff, r_, zeros
+ from path import path
+ 
+ from .observations import _save_window
+@@ -46,6 +46,23 @@
+     return array(map(int, text.split(",")))
+ 
+ 
++def divide_posterior_array(posterior_code, num_frames, num_sublabels):
++    """
++    takes a one-dimensional array whose values are integers of the form
++    label * num_sublabels + sublabel
++    and creates a two-dimensional array whose columns contain the label
++    and the sublabel in separate values. This is a convenience function to
++    provide the find_segment_starts() function with data in the same format
++    as during the viterbi task.
++    """
++    res = zeros((2, num_frames), DTYPE_IDENTIFY)
++    for frame_index in xrange(num_frames):
++        total_label = posterior_code[frame_index]
++        label, sublabel = divmod(total_label, num_sublabels)
++        res[:, frame_index] = array([label, sublabel])
++    return res
++
++
+ def parse_viterbi(lines, do_reverse=False, output_label="seg"):
+     """
+     returns: numpy.ndarray of size (num_frames,), type DTYPE_IDENTIFY
+@@ -163,34 +180,46 @@
+ 
+ 
+ def read_posterior_save_bed(coord, resolution, do_reverse,
+-                            outfilename_tmpl, num_labels, infile, output_label="seg"):
++                            outfilename_tmpl, num_labels, infile, 
++                            num_sublabels, output_label):
+     if do_reverse:
+         raise NotImplementedError
+-    # posterior not implemented in subseg or full mode
+-    if output_label != "seg":
+-        raise NotImplementedError
+-
++    num_sublabels = int(num_sublabels)
+     (chrom, start, end) = coord
+     num_frames = ceildiv(end - start, resolution)
+-    probs = read_posterior(infile, num_frames, num_labels)
++    probs = read_posterior(infile, num_frames, num_labels,
++                           num_sublabels, output_label)
+     probs_rounded = empty(probs.shape, int)
+ 
+     # Write posterior code file
+     posterior_code = argmax(probs, axis=1)
+-    start_pos, labels = find_segment_starts(posterior_code)
++    if output_label != "seg":
++        posterior_code = divide_posterior_array(posterior_code, num_frames,
++                                         num_sublabels)
++    start_pos, labels = find_segment_starts(posterior_code, output_label)
+     bed_filename = outfilename_tmpl % "_code"
+     save_bed(bed_filename, start_pos, labels, coord, resolution, int(num_labels))
++    if output_label == "subseg":
++        label_print_range = xrange(num_labels * num_sublabels)
++        label_names = label_print_range
++    elif output_label == "full":
++        label_print_range = xrange(num_labels * num_sublabels)
++        label_names = ("%d.%d" % divmod(label, num_sublabels)
++                             for label in label_print_range)
++    else:
++        label_print_range = xrange(num_labels)
++        label_names = label_print_range
+ 
+     # Write label-wise posterior bedgraph files
+     outfilenames = []
+-    for label_index in xrange(num_labels):
++    for label_index in label_names:
+         outfilenames.append(outfilename_tmpl % label_index)
+ 
+     # scale, round, and cast to int
+     (probs * POSTERIOR_SCALE_FACTOR).round(out=probs_rounded)
+ 
+     # print array columns as text to each outfile
+-    zipper = zip(outfilenames, probs_rounded.T, xrange(num_labels))
++    zipper = zip(outfilenames, probs_rounded.T, label_print_range)
+     for outfilename, probs_rounded_label, label_index in zipper:
+         # run-length encoding on the probs_rounded_label
+ 
+@@ -208,10 +237,12 @@
+ 
+ 
+ def load_posterior_save_bed(coord, resolution, do_reverse,
+-                            outfilename, num_labels, infilename):
++                            outfilename, num_labels, infilename,
++                            num_sublabels=1, output_label="seg"):
+     with open(infilename) as infile:
+         read_posterior_save_bed(coord, resolution, do_reverse, outfilename,
+-                                int(num_labels), infile)
++                                int(num_labels), infile, num_sublabels,
++                                output_label)
+ 
+ 
+ def parse_viterbi_save_bed(coord, resolution, do_reverse,
+@@ -257,9 +288,9 @@
+ 
+ 
+ def run_posterior_save_bed(coord, resolution, do_reverse, outfilename,
+-                           num_labels, output_label, genomedataname, float_filename,
+-                           int_filename, distribution,
+-                           track_indexes_text, *args):
++                           num_labels, num_sublabels, output_label, 
++                           genomedataname, float_filename, int_filename,
++                           distribution, track_indexes_text, *args):
+     # XXX: this whole function is duplicative of run_viterbi_save_bed
+     # and needs to be reduced convert from tuple
+     args = list(args)
+@@ -306,13 +337,14 @@
+ 
+     lines = output.splitlines()
+     return read_posterior_save_bed(coord, resolution, do_reverse, outfilename,
+-                                   int(num_labels), lines, output_label)
++                                   int(num_labels), lines,
++                                   num_sublabels, output_label)
+ 
+ 
+ def run_viterbi_save_bed(coord, resolution, do_reverse, outfilename,
+-                         num_labels, output_label, genomedataname, float_filename,
+-                         int_filename, distribution,
+-                         track_indexes_text, *args):
++                         num_labels, num_sublabels, output_label, 
++                         genomedataname, float_filename, int_filename, 
++                         distribution, track_indexes_text, *args):
+     # convert from tuple
+     args = list(args)
+     # a 2,000,000-frame output file is only 84 MiB so it is okay to
+diff --git a/test/simpleconcat/touchstone/identifydir/log/details.sh b/test/simpleconcat/touchstone/identifydir/log/details.sh
+--- a/test/simpleconcat/touchstone/identifydir/log/details.sh
++++ b/test/simpleconcat/touchstone/identifydir/log/details.sh
+@@ -1,4 +1,4 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 seg ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 seg ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 1 seg ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 1 seg ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+diff --git a/test/simplerecover/touchstone/identifydir/log/details.sh b/test/simplerecover/touchstone/identifydir/log/details.sh
+--- a/test/simplerecover/touchstone/identifydir/log/details.sh
++++ b/test/simplerecover/touchstone/identifydir/log/details.sh
+@@ -1,3 +1,3 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 seg ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 /tmp/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 1 seg ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 /tmp/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+diff --git a/test/simpleseg/touchstone/identifydir/log/details.sh b/test/simpleseg/touchstone/identifydir/log/details.sh
+--- a/test/simpleseg/touchstone/identifydir/log/details.sh
++++ b/test/simpleseg/touchstone/identifydir/log/details.sh
+@@ -1,3 +1,3 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 seg ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 1 seg ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T

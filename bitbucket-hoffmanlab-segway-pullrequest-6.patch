@@ -1,0 +1,46 @@
+# HG changeset patch
+# User Bitbucket <noreply@bitbucket.org>
+# Date 0 0
+# Node ID 9fe8d8602038c581402896ff70136853a8edb4ad
+# Parent  1324ae3a6942235fb600c7fe0f6b616014d6ae2e
+# Parent  f1f5a879defc9add1fc14c2d971b3ebf182f6760
+
+
+diff -r 1324ae3a6942235fb600c7fe0f6b616014d6ae2e -r 9fe8d8602038c581402896ff70136853a8edb4ad NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -54,6 +54,7 @@
+ * test: update for new GMTK
+ * prereqs: hgtools is now a prerequisite
+ * segway: add --output-label option to control segmentation output when using sublabels
++* segway: semi-supervised mode no longer causes assertion error
+ 
+ 1.1.0:
+ 
+diff -r 1324ae3a6942235fb600c7fe0f6b616014d6ae2e -r 9fe8d8602038c581402896ff70136853a8edb4ad segway/run.py
+--- a/segway/run.py
++++ b/segway/run.py
+@@ -683,6 +683,12 @@
+         track_group = TrackGroup()
+         tracknames_unquoted = set(track.name_unquoted for track in tracks)
+ 
++        # non-allowed special trackname
++        if "supervisionLabel" in tracknames:
++            raise ValueError("'supervisionLabel' trackname is internally "
++                             "reserved and not allowed in supplied "
++                             "tracknames")
++
+         for trackname in tracknames:
+             if trackname in tracknames_unquoted:
+                 raise ValueError("can't tie one track in multiple groups")
+@@ -1198,10 +1204,6 @@
+         if not any(track.is_data for track in tracks):
+             self.float_filelistpath = None
+ 
+-        # non-allowed special trackname
+-        tracknames_unquoted = [track.name_unquoted for track in tracks]
+-        assert "supervisionLabel" not in tracknames_unquoted
+-
+         # assert: none of the quoted tracknames are the same
+         if __debug__:
+             tracknames_quoted = [track.name for track in tracks]

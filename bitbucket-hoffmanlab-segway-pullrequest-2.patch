@@ -1,0 +1,20 @@
+# HG changeset patch
+# User Bitbucket <noreply@bitbucket.org>
+# Date 0 0
+# Node ID 260169b99253ebbdf02a998a2f569fdd92790732
+# Parent  a04fec55ee26e5911739936ae0a18556aed74b64
+# Parent  27069f01b8d3296ca425ac9e5cb5beabfd0c9da2
+
+
+diff -r a04fec55ee26e5911739936ae0a18556aed74b64 -r 260169b99253ebbdf02a998a2f569fdd92790732 segway/task.py
+--- a/segway/task.py
++++ b/segway/task.py
+@@ -72,7 +72,7 @@
+ 
+     # Printing random variables from (P,C,E)=(1,999,0) partitions
+     line = lines.next()
+-    assert line.startswith("Printing random variables from (P,C,E)")
++    assert line.startswith("Printing random variables from (P',C',E')")
+ 
+     # sentinel value
+     res = fill_array(SEG_INVALID, num_frames, DTYPE_IDENTIFY)

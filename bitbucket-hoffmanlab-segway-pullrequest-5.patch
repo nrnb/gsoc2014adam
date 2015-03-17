@@ -1,0 +1,446 @@
+# HG changeset patch
+# User Bitbucket <noreply@bitbucket.org>
+# Date 0 0
+# Node ID a3457ff412bf98e8631597ecea5e7ce4a40a210d
+# Parent  6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1
+# Parent  1324ae3a6942235fb600c7fe0f6b616014d6ae2e
+
+
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -53,6 +53,7 @@
+ * test: when files differ, output is in a form that makes it easier to diff
+ * test: update for new GMTK
+ * prereqs: hgtools is now a prerequisite
++* segway: add --output-label option to control segmentation output when using sublabels
+ 
+ 1.1.0:
+ 
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d doc/segway.rst
+--- a/doc/segway.rst
++++ b/doc/segway.rst
+@@ -256,10 +256,13 @@
+ option that enables hierarchical segmentation, where each segment
+ label is divided into a number of segment sublabels, each one with its
+ own Gaussian emission parameters. The
+-output segmentation will be defined in terms of individual sublabels,
+-where the output label number :math:`l` is defined in terms of the
+-(super) segment label :math:`l_0`, the sublabel :math:`l_1`, and the number of
+-sublabels per label :math:`n_1` using the formula :math:`l = l_0 n_1 + l_1`.
++output segmentation will be defined according to the 
++:option:`--output-label`\=\ *output_label* option, by default *seg*, 
++which will output by (super) segment label as normal. *subseg* 
++will output in terms of individual sublabels, only printing out the 
++sublabel part, and *full* will print out both the superlabel and
++the sublabel, separated by a period. For example, a coordinate
++assigned superlabel 1 and sublabel 0 would display as "1.0".
+ Using this feature effectively may require manipulation of model
+ parameters.
+ 
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d segway/_util.py
+--- a/segway/_util.py
++++ b/segway/_util.py
+@@ -17,7 +17,8 @@
+ import re
+ 
+ import colorbrewer
+-from numpy import (append, array, diff, empty, insert, intc, zeros)
++from numpy import (absolute, append, array, diff, empty, insert, intc, maximum,
++                    zeros)
+ 
+ from optbuild import Mixin_UseFullProgPath, OptionBuilder_ShortOptWithSpace_TF
+ from path import path
+@@ -316,7 +317,19 @@
+             yield chrom, filename, chromosome, chr_include_coords
+ 
+ 
+-def find_segment_starts(data):
++def extract_superlabel(label):
++    """
++    label is either an integer or a string with a superlabel and
++    sublabel part, in which case only the superlabel part is
++    returned
++    """
++    if isinstance(label, str):
++        return int(label.split(".")[0])
++    else:
++        return label
++
++
++def find_segment_starts(data, output_label="seg"):
+     """
+     finds the start of each segment
+ 
+@@ -324,14 +337,28 @@
+ 
+     returns lists of len num_segments+1, num_segments
+     """
+-    len_data = len(data)
++    if data.ndim > 1:
++        len_data = len(data[0])
++    else:
++        len_data = len(data)
+ 
+     # unpack tuple, ignore rest
+-    end_pos, = diff(data).nonzero()
++    seg_diffs = absolute(diff(data))
+ 
++    # if output_label is set to "full" or "subseg"
++    if output_label != "seg":
++        pos_diffs = maximum(seg_diffs[0], seg_diffs[1])
++    else:
++        pos_diffs = seg_diffs
++    end_pos, = pos_diffs.nonzero()
+     # add one to get the start positions, and add a 0 at the beginning
+     start_pos = insert(end_pos + 1, 0, 0)
+-    labels = data[start_pos]
++    if output_label == "full":
++        labels = array(["%d.%d" % segs for segs in zip(*data[:, start_pos])])
++    elif output_label == "subseg":
++        labels = data[1][start_pos]
++    else:
++        labels = data[start_pos]
+ 
+     # after generating labels, add an extraneous start position so
+     # where_seg+1 doesn't go out of bounds
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d segway/run.py
+--- a/segway/run.py
++++ b/segway/run.py
+@@ -73,6 +73,7 @@
+ MIN_NUM_SEGS = 2
+ NUM_SEGS = MIN_NUM_SEGS
+ NUM_SUBSEGS = 1
++OUTPUT_LABEL = "seg"
+ RULER_SCALE = 10
+ MAX_EM_ITERS = 100
+ 
+@@ -218,7 +219,7 @@
+          params_filename=str, dont_train_filename=str, seg_table_filename=str,
+          distribution=str, len_seg_strength=float,
+          segtransition_weight_scale=float, ruler_scale=int, resolution=int,
+-         num_segs=int, num_subsegs=int, track_specs=[str],
++         num_segs=int, num_subsegs=int, output_label=str, track_specs=[str],
+          reverse_worlds=[int])
+ 
+ # templates and formats
+@@ -252,8 +253,6 @@
+                                  "log_likelihood_filename"])
+ OFFSET_FILENAMES = 2  # where the filenames begin in Results
+ 
+-VITERBI_REGEX_FILTER = "^seg$"
+-
+ PROGS = dict(identify=VITERBI_PROG, posterior=POSTERIOR_PROG)
+ 
+ 
+@@ -579,6 +578,7 @@
+         # variables
+         self.num_segs = NUM_SEGS
+         self.num_subsegs = NUM_SUBSEGS
++        self.output_label = OUTPUT_LABEL
+         self.num_instances = NUM_INSTANCES
+         self.len_seg_strength = PRIOR_STRENGTH
+         self.distribution = DISTRIBUTION_DEFAULT
+@@ -645,6 +645,7 @@
+                         ("resolution",),
+                         ("num_labels", "num_segs"),
+                         ("num_sublabels", "num_subsegs"),
++                        ("output_label", "output_label"),
+                         ("max_train_rounds", "max_em_iters"),
+                         ("reverse_world", "reverse_worlds"),
+                         ("track", "track_specs")]
+@@ -2166,8 +2167,8 @@
+         prefix_args = [find_executable("segway-task"), "run", kind,
+                        output_filename, window.chrom,
+                        window.start, window.end, self.resolution, is_reverse,
+-                       self.num_segs, self.genomedataname, float_filepath,
+-                       int_filepath, self.distribution,
++                       self.num_segs, self.output_label, self.genomedataname,
++                       float_filepath, int_filepath, self.distribution,
+                        track_indexes_text]
+         output_filename = None
+ 
+@@ -2219,6 +2220,13 @@
+ 
+         filenames = dict(identify=self.viterbi_filenames,
+                          posterior=self.posterior_filenames)
++        
++        # if output_label == "subseg" or "full", need to catch
++        # superlabel and sublabel output from gmtk
++        if self.output_label != "seg":
++            VITERBI_REGEX_FILTER = "^(seg|subseg)$"
++        else:
++            VITERBI_REGEX_FILTER = "^seg$"
+ 
+         # -: standard output, processed by segway-task
+         kwargs = {"identify":
+@@ -2334,6 +2342,8 @@
+                         if (self.posterior and (self.recover_dirname
+                                                 or self.num_worlds != 1)):
+                             raise NotImplementedError  # XXX
++                        if (self.posterior and self.output_label != "seg"):
++                            raise NotImplementedError  # XXX
+ 
+                         self.run_identify_posterior()
+ 
+@@ -2445,6 +2455,12 @@
+                          help="make NUM segment sublabels"
+                          " (default %d)" % NUM_SUBSEGS)
+ 
++        group.add_option("--output-label", type=str,
++                         help="in the segmentation file, for each coordinate "
++                         "print only its superlabel (\"seg\"), only its "
++                         "sublabel (\"subseg\"), or both (\"full\")"
++                         "  (default %s)" % OUTPUT_LABEL)
++
+         group.add_option("--max-train-rounds", type=int, metavar="NUM",
+                          help="each training instance runs a maximum of NUM"
+                          " rounds (default %d)" % MAX_EM_ITERS)
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d segway/task.py
+--- a/segway/task.py
++++ b/segway/task.py
+@@ -21,8 +21,8 @@
+ 
+ from .observations import _save_window
+ from ._util import (BED_SCORE, BED_STRAND, ceildiv, DTYPE_IDENTIFY, EXT_FLOAT,
+-                    EXT_INT, EXT_LIST, fill_array, find_segment_starts,
+-                    get_label_color,
++                    EXT_INT, EXT_LIST, extract_superlabel, fill_array, 
++                    find_segment_starts, get_label_color,
+                     POSTERIOR_PROG, POSTERIOR_SCALE_FACTOR, read_posterior,
+                     VITERBI_PROG)
+ 
+@@ -45,10 +45,8 @@
+ def make_track_indexes(text):
+     return array(map(int, text.split(",")))
+ 
+-re_seg = re.compile(r"^seg\((\d+)\)=(\d+)$")
+ 
+-
+-def parse_viterbi(lines, do_reverse=False):
++def parse_viterbi(lines, do_reverse=False, output_label="seg"):
+     """
+     returns: numpy.ndarray of size (num_frames,), type DTYPE_IDENTIFY
+     """
+@@ -73,15 +71,26 @@
+     # Printing random variables from (P,C,E)=(1,999,0) partitions
+     line = lines.next()
+     assert line.startswith("Printing random variables from")
+-
++    seg_dict = {'seg': 0, 'subseg': 1}
++    # if output_label == "subseg" or "full", need to catch
++    # subseg output
++    if output_label != "seg":
++        re_seg = re.compile(r"^(seg|subseg)\((\d+)\)=(\d+)$")
++    else:
++        re_seg = re.compile(r"^(seg)\((\d+)\)=(\d+)$")
+     # sentinel value
+-    res = fill_array(SEG_INVALID, num_frames, DTYPE_IDENTIFY)
+-
++    res = fill_array(SEG_INVALID, (2, num_frames), DTYPE_IDENTIFY)
+     for line in lines:
+         # Ptn-0 P': seg(0)=24,seg(1)=24
+         if line.startswith(MSG_SUCCESS):
+-            assert (res != SEG_INVALID).all()
+-            return res
++            assert (res[0] != SEG_INVALID).all()
++            # if output_label == "subseg" or "full",
++            # res will have 2 rows
++            if output_label != "seg":
++                assert (res[1] != SEG_INVALID).all()
++                return res
++            else:
++                return res[0]
+ 
+         assert line.startswith("Ptn-")
+ 
+@@ -92,13 +101,13 @@
+             if not match:
+                 continue
+ 
+-            index = int(match.group(1))
++            index = int(match.group(2))
+             if do_reverse:
+                 index = -1 - index  # -1, -2, -3, etc.
+ 
+-            val = int(match.group(2))
+-
+-            res[index] = val
++            val = int(match.group(3))
++            seg_index = seg_dict[match.group(1)]
++            res[seg_index][index] = val
+ 
+     # shouldn't get to this point
+     raise ValueError("%s did not complete successfully" % VITERBI_PROG.prog)
+@@ -108,7 +117,7 @@
+ # XXX: should move this function somewhere else
+ 
+ def write_bed(outfile, start_pos, labels, coord, resolution, num_labels,
+-              num_cols=None):
++              num_cols=None, num_sublabels=None, sublabels=None):
+     """
+     start_pos is an array
+     """
+@@ -125,16 +134,18 @@
+     start_pos[-1] = region_end
+ 
+     # score_step = (SCORE_MAX - SCORE_MIN) / (num_labels - 1)
++    label_colors = [get_label_color(extract_superlabel(seg_label)) for 
++                    seg_label in labels]
+ 
+-    zipper = zip(start_pos[:-1], start_pos[1:], labels)
++    zipper = zip(start_pos[:-1], start_pos[1:], labels, label_colors)
+ 
+     # this is easily concatenated since it has no context
+-    for seg_start, seg_end, seg_label in zipper:
++    for seg_start, seg_end, seg_label, label_color in zipper:
+         name = str(seg_label)
+ 
+         chrom_start = str(seg_start)
+         chrom_end = str(seg_end)
+-        item_rgb = get_label_color(seg_label)
++        item_rgb = label_color
+ 
+         row = [chrom, chrom_start, chrom_end, name, BED_SCORE, BED_STRAND,
+                chrom_start, chrom_end, item_rgb][:num_cols]
+@@ -152,9 +163,12 @@
+ 
+ 
+ def read_posterior_save_bed(coord, resolution, do_reverse,
+-                            outfilename_tmpl, num_labels, infile):
++                            outfilename_tmpl, num_labels, infile, output_label="seg"):
+     if do_reverse:
+         raise NotImplementedError
++    # posterior not implemented in subseg or full mode
++    if output_label != "seg":
++        raise NotImplementedError
+ 
+     (chrom, start, end) = coord
+     num_frames = ceildiv(end - start, resolution)
+@@ -201,10 +215,10 @@
+ 
+ 
+ def parse_viterbi_save_bed(coord, resolution, do_reverse,
+-                           viterbi_lines, bed_filename, num_labels):
+-    data = parse_viterbi(viterbi_lines, do_reverse)
++                           viterbi_lines, bed_filename, num_labels, output_label):
++    data = parse_viterbi(viterbi_lines, do_reverse, output_label)
+ 
+-    start_pos, labels = find_segment_starts(data)
++    start_pos, labels = find_segment_starts(data, output_label)
+ 
+     save_bed(bed_filename, start_pos, labels, coord, resolution,
+              int(num_labels))
+@@ -243,7 +257,7 @@
+ 
+ 
+ def run_posterior_save_bed(coord, resolution, do_reverse, outfilename,
+-                           num_labels, genomedataname, float_filename,
++                           num_labels, output_label, genomedataname, float_filename,
+                            int_filename, distribution,
+                            track_indexes_text, *args):
+     # XXX: this whole function is duplicative of run_viterbi_save_bed
+@@ -292,11 +306,11 @@
+ 
+     lines = output.splitlines()
+     return read_posterior_save_bed(coord, resolution, do_reverse, outfilename,
+-                                   int(num_labels), lines)
++                                   int(num_labels), lines, output_label)
+ 
+ 
+ def run_viterbi_save_bed(coord, resolution, do_reverse, outfilename,
+-                         num_labels, genomedataname, float_filename,
++                         num_labels, output_label, genomedataname, float_filename,
+                          int_filename, distribution,
+                          track_indexes_text, *args):
+     # convert from tuple
+@@ -346,7 +360,7 @@
+     lines = output.splitlines()
+ 
+     return parse_viterbi_save_bed(coord, resolution, do_reverse,
+-                                  lines, outfilename, num_labels)
++                                  lines, outfilename, num_labels, output_label)
+ 
+ TASKS = {("run", "viterbi"): run_viterbi_save_bed,
+          ("load", "viterbi"): load_viterbi_save_bed,
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/data/touchstone/identifydir/log/details.sh
+--- a/test/data/touchstone/identifydir/log/details.sh
++++ b/test/data/touchstone/identifydir/log/details.sh
+@@ -1,4 +1,5 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr21 9411193 9595548 1 0 4 ../test.genomedata (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+-(%[^ ]+%)/segway-task run posterior identifydir/posterior/posterior%s.0.bed chr21 9411193 9595548 1 0 4 ../test.genomedata (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cCliquePrintRange 1:1 -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -doDistributeEvidence T -eCliquePrintRange 1:1 -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.posterior.txt -lst 100000 -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pCliquePrintRange 1:1 -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.posterior.trifile -verbosity 0
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr21 9411193 9595548 1 0 4 seg ../test.genomedata (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run posterior identifydir/posterior/posterior%s.0.bed chr21 9411193 9595548 1 0 4 seg ../test.genomedata (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr21.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cCliquePrintRange 1:1 -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -doDistributeEvidence T -eCliquePrintRange 1:1 -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.posterior.txt -lst 100000 -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pCliquePrintRange 1:1 -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.posterior.trifile -verbosity 0
++
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/data/touchstone/traindir/train.tab
+--- a/test/data/touchstone/traindir/train.tab
++++ b/test/data/touchstone/traindir/train.tab
+@@ -5,6 +5,7 @@
+ len_seg_strength	0
+ num_segs	4
+ num_subsegs	1
++output_label	seg
+ params_filename	traindir/params/params.params
+ resolution	1
+ ruler_scale	10
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/simpleconcat/touchstone/identifydir/log/details.sh
+--- a/test/simpleconcat/touchstone/identifydir/log/details.sh
++++ b/test/simpleconcat/touchstone/identifydir/log/details.sh
+@@ -1,4 +1,4 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 seg ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi(%[0-1]%).bed chr1 0 8000 1 0 4 seg ../simpleconcat.genomedata /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).float32 /tmp/chr1.000(%[0-1]%).(%[0-9a-f]{32}%).int asinh_norm (%[0-3]%),(%[0-3]%) -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/simpleconcat/touchstone/traindir/train.tab
+--- a/test/simpleconcat/touchstone/traindir/train.tab
++++ b/test/simpleconcat/touchstone/traindir/train.tab
+@@ -5,6 +5,7 @@
+ len_seg_strength	0
+ num_segs	4
+ num_subsegs	1
++output_label	seg
+ params_filename	traindir/params/params.params
+ resolution	1
+ ruler_scale	10
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/simplerecover/touchstone/identifydir/log/details.sh
+--- a/test/simplerecover/touchstone/identifydir/log/details.sh
++++ b/test/simplerecover/touchstone/identifydir/log/details.sh
+@@ -1,3 +1,3 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 /tmp/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 seg ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 /tmp/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/simplerecover/touchstone/traindir/train.tab
+--- a/test/simplerecover/touchstone/traindir/train.tab
++++ b/test/simplerecover/touchstone/traindir/train.tab
+@@ -5,6 +5,7 @@
+ len_seg_strength	0
+ num_segs	4
+ num_subsegs	1
++output_label	seg
+ params_filename	traindir/params/params.params
+ resolution	1
+ ruler_scale	10
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/simpleseg/touchstone/identifydir/log/details.sh
+--- a/test/simpleseg/touchstone/identifydir/log/details.sh
++++ b/test/simpleseg/touchstone/identifydir/log/details.sh
+@@ -1,3 +1,3 @@
+ ## segway (%[^ ]+%) run (%[0-9a-f]{32}%) at (%[0-9]{4}%)-(%[0-9]{2}%)-(%[0-9]{2}%) (%[0-9]{2}%):(%[0-9]{2}%):(%[0-9]{2}%).(%[0-9]{1,}%)
+ (%[^ ]+%)/gmtkTriangulate -cppCommandOptions "-DCARD_SEG=4 -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -outputTriangulatedFile identifydir/triangulation/segway.str.4.1.trifile -strFile traindir/segway.str -verbosity 0
+-(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
++(%[^ ]+%)/segway-task run viterbi identifydir/viterbi/viterbi0.bed chr1 0 8000 1 0 4 seg ../simpleseg.genomedata /tmp/chr1.0000.(%[0-9a-f]{32}%).float32 (%[^ ]+%)/chr1.0000.(%[0-9a-f]{32}%).int asinh_norm 0,1 -base 3 -cVitRegexFilter ^seg$ -cliqueTableNormalize 0.0 -componentCache F -cppCommandOptions "-DCARD_SEG=4 -DINPUT_PARAMS_FILENAME=traindir/params/params.params -DCARD_FRAMEINDEX=2000000 -DSEGTRANSITION_WEIGHT_SCALE=1.0 -DCARD_SUBSEG=1" -deterministicChildrenStore F -eVitRegexFilter ^seg$ -fmt1 binary -fmt2 binary -hashLoadFactor 0.98 -inputMasterFile traindir/params/input.master -island T -iswp1 F -iswp2 F -jtFile identifydir/log/jt_info.txt -lst 100000 -mVitValsFile - -nf1 2 -nf2 0 -ni1 0 -ni2 2 -obsNAN T -of1 identifydir/observations/float32.list -of2 identifydir/observations/int.list -pVitRegexFilter ^seg$ -strFile traindir/segway.str -triFile identifydir/triangulation/segway.str.4.1.trifile -verbosity 0 -vitCaseSensitiveRegexFilter T
+diff -r 6e7f7f585c480ba6813f69e83a6c9c1f62b3c3c1 -r a3457ff412bf98e8631597ecea5e7ce4a40a210d test/simpleseg/touchstone/traindir/train.tab
+--- a/test/simpleseg/touchstone/traindir/train.tab
++++ b/test/simpleseg/touchstone/traindir/train.tab
+@@ -5,6 +5,7 @@
+ len_seg_strength	0
+ num_segs	4
+ num_subsegs	1
++output_label	seg
+ params_filename	traindir/params/params.params
+ resolution	1
+ ruler_scale	10
